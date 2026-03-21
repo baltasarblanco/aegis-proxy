@@ -1,0 +1,18 @@
+[package]
+name = "aegis_proxy"
+version = "0.1.0"
+edition = "2021"
+authors = ["Baltasar Blanco <Arquitecto de Sistemas>"]
+
+[profile.release]
+opt-level = 3          # Nivel máximo de optimización de velocidad
+lto = "fat"            # Link-Time Optimization: Analiza todo el árbol de dependencias para eliminar código muerto
+codegen-units = 1      # Obliga a compilar todo en un solo hilo (tarda más en compilar, pero corre muchísimo más rápido)
+panic = "abort"        # Si hay un error fatal, aborta instantáneamente (ahorra memoria al no guardar el rastro del error)
+strip = true           # Elimina símbolos de depuración del binario final para hacerlo más ligero
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-uring = "0.5.0"
+socket2 = { version = "0.6.3", features = ["all"] }
+core_affinity = "0.8"
