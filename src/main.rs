@@ -6,12 +6,37 @@ use tokio_uring::net::TcpListener;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use tokio::time::{interval, Duration};
 
 const BIND_ADDR: &str = "0.0.0.0:8081";      // <--- El Escudo Frontal (AEGIS)
 const CHRONOS_ADDR: &str = "127.0.0.1:8080"; // <--- La Bóveda LSM (Chronos)
 const TCP_BACKLOG: i32 = 4096;
 const BUFFER_SIZE: usize = 4096;
 const POOL_CAPACITY: usize = 1024;
+
+// 📊 FASE 4: Stark HUD (Telemetría Atómica sin Candados)
+struct Telemetry {
+    active_connections: AtomicUsize,
+    total_bytes: AtomicUsize,
+}
+
+// 🛡️ RAII Guard: Garantiza que las conexiones se resten automáticamente al desconectar
+struct ConnectionGuard {
+    tele: Arc<Telemetry>,
+}
+impl ConnectionGuard {
+    fn new(tele: Arc<Telemetry>) -> Self {
+        tele.active_connections.fetch_add(1, Ordering::Relaxed);
+        Self { tele }
+    }
+}
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.tele.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -22,8 +47,15 @@ async fn main() {
     let addr: SocketAddr = BIND_ADDR.parse().expect("Dirección IP/Puerto inválidos");
     let mut handles = vec![];
 
+    // Instanciamos el Satélite de Telemetría Global
+    let telemetry = Arc::new(Telemetry {
+        active_connections: AtomicUsize::new(0),
+        total_bytes: AtomicUsize::new(0),
+    });
+
     for core_id in core_ids {
         let mut shutdown_rx = shutdown_tx.subscribe();
+        let tele_clone = telemetry.clone(); // Clonamos la referencia atómica para el hilo
 
         let handle = thread::spawn(move || {
             core_affinity::set_for_current(core_id);
@@ -44,49 +76,51 @@ async fn main() {
             
             tokio_uring::start(async move {
                 let listener = TcpListener::from_std(std_listener);
-                println!("🚀 [AEGIS-CORE-{}] Motor de Memoria y Red encendido.", core_id.id);
+                println!("🚀 [AEGIS-CORE-{}] Motor encendido.", core_id.id);
 
                 loop {
                     tokio::select! {
                         accept_res = listener.accept() => {
                             if let Ok((stream, _peer_addr)) = accept_res {
                                 let pool_ref = pool.clone();
+                                let task_telemetry = tele_clone.clone();
                                 
                                 tokio_uring::spawn(async move {
+                                    // 🛡️ El Guardia Atómico nace aquí. Morirá automáticamente al salir de este bloque.
+                                    let _guard = ConnectionGuard::new(task_telemetry.clone());
+
                                     let mut buf = pool_ref.borrow_mut().pop_front()
                                         .unwrap_or_else(|| Vec::with_capacity(BUFFER_SIZE));
-                                    
-                                    buf.clear(); // Limpieza inicial térmica
+                                    buf.clear(); 
 
                                     let backend_addr: SocketAddr = CHRONOS_ADDR.parse().unwrap();
 
                                     if let Ok(chronos_stream) = tokio_uring::net::TcpStream::connect(backend_addr).await {
-                                        
-                                        // 1. Leemos del cliente
                                         let (read_res, buf_read) = stream.read(buf).await;
 
                                         if let Ok(n) = read_res {
                                             if n > 0 {
-                                                // 2. 💥 TÁCTICA OMEGA: write_all nativo al backend
+                                                // 📊 Sumamos los bytes entrantes
+                                                task_telemetry.total_bytes.fetch_add(n, Ordering::Relaxed);
+
                                                 let (write_res, mut buf_written) = chronos_stream.write_all(buf_read).await;
                                                 
                                                 if write_res.is_ok() {
-                                                    buf_written.clear(); // Reseteamos la longitud a 0 para reusar el buffer
-                                                    
-                                                    // 3. Leemos la respuesta de Chronos
+                                                    buf_written.clear(); 
                                                     let (resp_res, buf_resp) = chronos_stream.read(buf_written).await;
 
                                                     if let Ok(resp_n) = resp_res {
                                                         if resp_n > 0 {
-                                                            // 4. 💥 write_all de vuelta al cliente
+                                                            // 📊 Sumamos los bytes salientes (respuesta de Chronos)
+                                                            task_telemetry.total_bytes.fetch_add(resp_n, Ordering::Relaxed);
+
                                                             let (_final_res, mut buf_final) = stream.write_all(buf_resp).await;
                                                             buf_final.clear();
                                                             pool_ref.borrow_mut().push_back(buf_final);
                                                             return;
                                                         }
                                                     }
-                                                    let mut safe_buf = buf_resp; 
-                                                    safe_buf.clear();
+                                                    let mut safe_buf = buf_resp; safe_buf.clear();
                                                     pool_ref.borrow_mut().push_back(safe_buf);
                                                     return;
                                                 }
@@ -95,8 +129,7 @@ async fn main() {
                                                 return;
                                             }
                                         }
-                                        let mut safe_buf = buf_read; 
-                                        safe_buf.clear();
+                                        let mut safe_buf = buf_read; safe_buf.clear();
                                         pool_ref.borrow_mut().push_back(safe_buf);
                                         return;
                                     }
@@ -113,9 +146,30 @@ async fn main() {
         handles.push(handle);
     }
 
-    println!("🛡️ [AEGIS CONTROL PLANE] Todos los sistemas nominales. Presiona Ctrl+C para apagado quirúrgico.");
-    tokio::signal::ctrl_c().await.expect("Falla al instalar el manejador de Ctrl+C");
-    println!("\n⚠️ [AEGIS CONTROL PLANE] Ctrl+C detectado. Iniciando apagado de la Hidra...");
+    // 🖥️ EL TABLERO HOLOGRÁFICO (Control Plane)
+    println!("🛡️ [AEGIS CONTROL PLANE] Todos los sistemas nominales. HUD Activado.");
+    let mut ticker = interval(Duration::from_secs(1));
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("\n⚠️ [AEGIS CONTROL PLANE] Ctrl+C detectado. Iniciando apagado de la Hidra...");
+                break;
+            }
+            _ = ticker.tick() => {
+                // Leemos la memoria atómica sin bloquear a los hilos trabajadores
+                let conns = telemetry.active_connections.load(Ordering::Relaxed);
+                let bytes = telemetry.total_bytes.load(Ordering::Relaxed);
+                let mb = bytes as f64 / 1_048_576.0;
+                
+                // Imprimimos solo si hay tráfico para no ensuciar la consola en reposo
+                if conns > 0 || bytes > 0 {
+                    println!("📊 [HUD] Conexiones Activas: {} | Tráfico Total: {:.4} MB", conns, mb);
+                }
+            }
+        }
+    }
+
     let _ = shutdown_tx.send(());
     for handle in handles {
         handle.join().unwrap();
