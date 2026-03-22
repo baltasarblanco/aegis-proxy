@@ -9,7 +9,7 @@ AEGIS discards traditional global thread-pools and standard `epoll` event loops.
 * **Hardware Load Balancing (`SO_REUSEPORT`):** Raw sockets are forged in C (`socket2`) before entering Rust. We rely on the NIC and the Linux Kernel's eBPF/Hash algorithms to distribute incoming SYN packets directly to the isolated cores.
 * **Quantum I/O (`io_uring`):** Uses `tokio-uring` to completely bypass `epoll` syscall overhead, handling network operations proactively via shared-memory Submission/Completion Queues with the Kernel.
 * **Zero-Allocation Thermal Pools:** Pre-allocated Thread-Local Memory Pools (`VecDeque` with pre-reserved capacities). Memory is recycled, never dropped. **Zero `malloc` calls under DDoS loads.**
-* **Lock-Free Atomic Telemetry:** Real-time HUD and traffic tracking using `AtomicUsize` with `Ordering::Relaxed`. Zero Mutexes, zero thread blocking.
+* **Quantum Padding:** Telemetry atomics are wrapped in `#[repr(align(64))]` to perfectly align with CPU cache lines, completely eradicating False Sharing across cores.
 
 ## 🚀 The 5 Phases of AEGIS
 - [x] **Phase 1: Silicon Topology.** Core detection, thread pinning, raw socket forging, and isolated `io_uring` runtimes.
@@ -18,38 +18,30 @@ AEGIS discards traditional global thread-pools and standard `epoll` event loops.
 - [x] **Phase 4: Stark HUD.** Lock-free atomic telemetry (Data Plane) and Graceful Shutdown coordinated via a Broadcast Control Plane.
 - [x] **Phase 5: Symbiosis.** Persistent connection pooling (Thread-Local Hot Pipes) with the Chronos LSM-Tree backend.
 
-## 📊 Benchmarks & Telemetry (Phase 5 - Hot Pipes)
+## 📊 Benchmarks & Telemetry
 Tested on local consumer hardware (AMD Ryzen) routing traffic to a local LSM-Tree Database (Chronos). Implementing Thread-Local Connection Pooling **doubled throughput** and completely eradicated TCP Handshake overhead, achieving **sub-millisecond P99 latencies** across the entire stack.
 
-**Attack Vector:** `ab -n 100000 -c 200 http://127.0.0.1:8081/`
+**Attack Vector (500k Sustained Keep-Alive):** `ab -k -n 500000 -c 200 http://127.0.0.1:8081/`
 
 | Metric | Result | Note |
 | :--- | :--- | :--- |
-| **Complete Requests** | `100,000` | 100% Success Rate |
+| **Complete Requests** | `500,000` | 100% Success Rate |
 | **Failed Requests** | `0` | Zero dropped connections |
-| **Concurrency Level** | `200` | Simultaneous active sockets |
-| **Requests per Second** | `~8,633 [#/sec]` | Full Proxy + DB Round-Trips |
+| **Requests per Second** | `~8,400+ [#/sec]` | Full Proxy + DB Round-Trips |
 | **P99 Latency** | `< 1 ms` | 99% of requests routed in less than 1 millisecond |
 | **Max Latency** | `4 ms` | Absolute worst-case scenario |
 
-### Connection Times (ms)
-```text
-              min  mean[+/-sd] median   max
-Connect:        0    0   0.0      0       0
-Processing:     0    0   0.2      0       9
-Waiting:        0    0   0.2      0       9
-Total:          0    0   0.2      0       9
-```
-## 🛠️ Quick Start
+## 🛰️ Observability (Grafana & Prometheus)
+AEGIS features a lock-free, zero-cost HTTP metrics satellite running on the Control Plane (`port 8082`). You can visualize the RPS and Bandwidth in real-time.
 
-1. Compile with aggressive LTO optimizations:
+1. Boot the proxy and the backend:
 ```bash
-cargo build --release
+cargo run --release
 ```
-2. Execute the binary (requires Linux Kernel 6.1+ for optimal io_uring support):
+2. Launch the telemetry stack:
 
 ```bash
-./target/release/aegis_proxy
+docker compose up -d
 ```
 
-3. Monitor the Atomic HUD in the control plane terminal while blasting the proxy with your benchmarking tool of choice.
+3. Open http://localhost:3000 to view the live dashboard during load testing.
