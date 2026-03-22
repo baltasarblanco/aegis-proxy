@@ -16,10 +16,10 @@ AEGIS discards traditional global thread-pools and standard `epoll` event loops.
 - [x] **Phase 2: The Thermal Loop.** Zero-allocation runtime. Pre-allocated Thread-Local Memory Pools (Slab Allocators).
 - [x] **Phase 3: Particle Accelerator.** L4 Routing and Zero-Copy data passing directly through Kernel shared rings.
 - [x] **Phase 4: Stark HUD.** Lock-free atomic telemetry (Data Plane) and Graceful Shutdown coordinated via a Broadcast Control Plane.
-- [ ] **Phase 5: Symbiosis.** Persistent connection pooling and load balancing with the Chronos LSM-Tree backend.
+- [x] **Phase 5: Symbiosis.** Persistent connection pooling (Thread-Local Hot Pipes) with the Chronos LSM-Tree backend.
 
-## 📊 Benchmarks & Telemetry (Phase 4)
-Tested on local consumer hardware (AMD Ryzen) routing traffic to a local LSM-Tree Database. The proxy successfully absorbed and routed a **100,000 Request Spike** with **Zero Dropped Packets** and sub-millisecond P99 latencies.
+## 📊 Benchmarks & Telemetry (Phase 5 - Hot Pipes)
+Tested on local consumer hardware (AMD Ryzen) routing traffic to a local LSM-Tree Database (Chronos). Implementing Thread-Local Connection Pooling **doubled throughput** and completely eradicated TCP Handshake overhead, achieving **sub-millisecond P99 latencies** across the entire stack.
 
 **Attack Vector:** `ab -n 100000 -c 200 http://127.0.0.1:8081/`
 
@@ -28,9 +28,9 @@ Tested on local consumer hardware (AMD Ryzen) routing traffic to a local LSM-Tre
 | **Complete Requests** | `100,000` | 100% Success Rate |
 | **Failed Requests** | `0` | Zero dropped connections |
 | **Concurrency Level** | `200` | Simultaneous active sockets |
-| **Requests per Second** | `~4,460 [#/sec]` | Full L4 Routing Round-Trips |
-| **P99 Latency** | `1 ms` | 99% of requests routed in <= 1 millisecond |
-| **Max Latency** | `9 ms` | Absolute worst-case scenario |
+| **Requests per Second** | `~8,633 [#/sec]` | Full Proxy + DB Round-Trips |
+| **P99 Latency** | `< 1 ms` | 99% of requests routed in less than 1 millisecond |
+| **Max Latency** | `4 ms` | Absolute worst-case scenario |
 
 ### Connection Times (ms)
 ```text
