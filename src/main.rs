@@ -1,98 +1,124 @@
-use core_affinity::CoreId;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::thread;
 use tokio::sync::broadcast;
 use tokio_uring::net::TcpListener;
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::rc::Rc;
 
-const BIND_ADDR: &str = "0.0.0.0:8080";
+const BIND_ADDR: &str = "0.0.0.0:8081";      // <--- El Escudo Frontal (AEGIS)
+const CHRONOS_ADDR: &str = "127.0.0.1:8080"; // <--- La Bóveda LSM (Chronos)
 const TCP_BACKLOG: i32 = 4096;
+const BUFFER_SIZE: usize = 4096;
+const POOL_CAPACITY: usize = 1024;
 
-// EL Plano de Control: Usamos un runtime ligero de un solo hilo para gestionar señales.
-// NO usará la CPU a menos que presiones Ctrl+C.
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     println!("⚙️ [AEGIS CONTROL PLANE] Iniciando secuencia de arranque...");
 
-    // 1. Detección de topología
     let core_ids = core_affinity::get_core_ids().expect("Error crítico: No se puede leer la topología");
-    
-    // 2. EL Botón del Pánico (Canal de Radio Broadcast)
-    // EL canal tiene capacidad para 16 mensajes en vuelo.
     let (shutdown_tx, _) = broadcast::channel::<()>(16);
-
     let addr: SocketAddr = BIND_ADDR.parse().expect("Dirección IP/Puerto inválidos");
     let mut handles = vec![];
 
-    // 3. Despliege del Plano de Datos (Workers)
     for core_id in core_ids {
-        // Entregamos un receptor de radio a cada clon antes de que nazca
         let mut shutdown_rx = shutdown_tx.subscribe();
 
         let handle = thread::spawn(move || {
-            // Afinidad y Forja (Idéntico a la versión anterior)
             core_affinity::set_for_current(core_id);
+            
+            let mut local_pool = VecDeque::with_capacity(POOL_CAPACITY);
+            for _ in 0..POOL_CAPACITY {
+                local_pool.push_back(Vec::with_capacity(BUFFER_SIZE));
+            }
+            let pool = Rc::new(RefCell::new(local_pool));
+
             let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
             socket.set_reuse_port(true).unwrap();
             socket.set_reuse_address(true).unwrap();
             socket.set_nonblocking(true).unwrap();
             socket.bind(&addr.into()).unwrap();
             socket.listen(TCP_BACKLOG).unwrap();
-
             let std_listener: StdTcpListener = socket.into();
-
-            // Ignición del runtime io_uring para este núcleo
+            
             tokio_uring::start(async move {
                 let listener = TcpListener::from_std(std_listener);
-                println!("🚀 [AEGIS-CORE-{}] En línea y a la escucha.", core_id.id);
+                println!("🚀 [AEGIS-CORE-{}] Motor de Memoria y Red encendido.", core_id.id);
 
-                // EL Bucle Infinito del Worker
                 loop {
-                    // tokio::select! nos permite escuchar dos futuros al mismo tiempo.
                     tokio::select! {
-                        // Evento A: Llega un cliente por hardware
                         accept_res = listener.accept() => {
-                            match accept_res {
-                                Ok((_stream, _peer_addr)) => {
-                                    // Cliente recibido en el anillo. Lo soltamos (Cierre TCP inmediato).
-                                } 
-                                Err(e) => { 
-                                    eprintln!("Error en núcleo {}: {}", core_id.id, e); 
-                                }
+                            if let Ok((stream, _peer_addr)) = accept_res {
+                                let pool_ref = pool.clone();
+                                
+                                tokio_uring::spawn(async move {
+                                    let mut buf = pool_ref.borrow_mut().pop_front()
+                                        .unwrap_or_else(|| Vec::with_capacity(BUFFER_SIZE));
+                                    
+                                    buf.clear(); // Limpieza inicial térmica
+
+                                    let backend_addr: SocketAddr = CHRONOS_ADDR.parse().unwrap();
+
+                                    if let Ok(chronos_stream) = tokio_uring::net::TcpStream::connect(backend_addr).await {
+                                        
+                                        // 1. Leemos del cliente
+                                        let (read_res, buf_read) = stream.read(buf).await;
+
+                                        if let Ok(n) = read_res {
+                                            if n > 0 {
+                                                // 2. 💥 TÁCTICA OMEGA: write_all nativo al backend
+                                                let (write_res, mut buf_written) = chronos_stream.write_all(buf_read).await;
+                                                
+                                                if write_res.is_ok() {
+                                                    buf_written.clear(); // Reseteamos la longitud a 0 para reusar el buffer
+                                                    
+                                                    // 3. Leemos la respuesta de Chronos
+                                                    let (resp_res, buf_resp) = chronos_stream.read(buf_written).await;
+
+                                                    if let Ok(resp_n) = resp_res {
+                                                        if resp_n > 0 {
+                                                            // 4. 💥 write_all de vuelta al cliente
+                                                            let (_final_res, mut buf_final) = stream.write_all(buf_resp).await;
+                                                            buf_final.clear();
+                                                            pool_ref.borrow_mut().push_back(buf_final);
+                                                            return;
+                                                        }
+                                                    }
+                                                    let mut safe_buf = buf_resp; 
+                                                    safe_buf.clear();
+                                                    pool_ref.borrow_mut().push_back(safe_buf);
+                                                    return;
+                                                }
+                                                buf_written.clear();
+                                                pool_ref.borrow_mut().push_back(buf_written);
+                                                return;
+                                            }
+                                        }
+                                        let mut safe_buf = buf_read; 
+                                        safe_buf.clear();
+                                        pool_ref.borrow_mut().push_back(safe_buf);
+                                        return;
+                                    }
+                                    buf.clear();
+                                    pool_ref.borrow_mut().push_back(buf);
+                                });
                             }
                         }
-                        // Evento B: EL Plano de Control grita por la radio
-                        _ = shutdown_rx.recv() => {
-                            println!("🛑 [AEGIS-CORE-{}] Señal de apagado recibida. Purgando anillo y terminando.", core_id.id);
-                            break; // Rompemos el bucle infinito. El runtime io_uring se apagará limpiamente.
-                        }
+                        _ = shutdown_rx.recv() => break,
                     }
                 }
             });
         });
-
         handles.push(handle);
     }
 
-    // 4. El Letargo del Director
     println!("🛡️ [AEGIS CONTROL PLANE] Todos los sistemas nominales. Presiona Ctrl+C para apagado quirúrgico.");
-    
-    // El hilo principal se duerme aquí, esperando la señal SIGINT del Sistema Operativo.
     tokio::signal::ctrl_c().await.expect("Falla al instalar el manejador de Ctrl+C");
-
-    // 5. Secuencia de Apagado Quirúrgico
     println!("\n⚠️ [AEGIS CONTROL PLANE] Ctrl+C detectado. Iniciando apagado de la Hidra...");
-    
-    // Enviamos un único mensaje por la radio. Los 16 receptores lo escucharán simultáneamente.
     let _ = shutdown_tx.send(());
-
-    // Esperamos a que cada hilo del SO termine su bucle, cierre sus sockets y devuelva la RAM.
     for handle in handles {
         handle.join().unwrap();
     }
-
     println!("💀 [AEGIS CONTROL PLANE] Apagado completo. Exit Code 0.");
 }
-
-
-
