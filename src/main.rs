@@ -15,14 +15,13 @@ const CHRONOS_ADDR: &str = "127.0.0.1:8080"; // <--- La Bóveda LSM (Chronos)
 const TCP_BACKLOG: i32 = 4096;
 const BUFFER_SIZE: usize = 4096;
 const POOL_CAPACITY: usize = 1024;
+const MAX_HOT_PIPES: usize = 64;             // <--- FASE 5: Máximo de conexiones persistentes por núcleo
 
-// 📊 FASE 4: Stark HUD (Telemetría Atómica sin Candados)
 struct Telemetry {
     active_connections: AtomicUsize,
     total_bytes: AtomicUsize,
 }
 
-// 🛡️ RAII Guard: Garantiza que las conexiones se resten automáticamente al desconectar
 struct ConnectionGuard {
     tele: Arc<Telemetry>,
 }
@@ -47,7 +46,6 @@ async fn main() {
     let addr: SocketAddr = BIND_ADDR.parse().expect("Dirección IP/Puerto inválidos");
     let mut handles = vec![];
 
-    // Instanciamos el Satélite de Telemetría Global
     let telemetry = Arc::new(Telemetry {
         active_connections: AtomicUsize::new(0),
         total_bytes: AtomicUsize::new(0),
@@ -55,16 +53,21 @@ async fn main() {
 
     for core_id in core_ids {
         let mut shutdown_rx = shutdown_tx.subscribe();
-        let tele_clone = telemetry.clone(); // Clonamos la referencia atómica para el hilo
+        let tele_clone = telemetry.clone();
 
         let handle = thread::spawn(move || {
             core_affinity::set_for_current(core_id);
             
+            // Pool de Memoria (RAM)
             let mut local_pool = VecDeque::with_capacity(POOL_CAPACITY);
             for _ in 0..POOL_CAPACITY {
                 local_pool.push_back(Vec::with_capacity(BUFFER_SIZE));
             }
             let pool = Rc::new(RefCell::new(local_pool));
+
+            // 💥 FASE 5: Pool de Conexiones Persistentes (Tuberías Calientes)
+            let local_conn_pool = VecDeque::with_capacity(MAX_HOT_PIPES);
+            let conn_pool = Rc::new(RefCell::new(local_conn_pool));
 
             let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
             socket.set_reuse_port(true).unwrap();
@@ -76,65 +79,81 @@ async fn main() {
             
             tokio_uring::start(async move {
                 let listener = TcpListener::from_std(std_listener);
-                println!("🚀 [AEGIS-CORE-{}] Motor encendido.", core_id.id);
+                println!("🚀 [AEGIS-CORE-{}] Motor y Tuberías encendidas.", core_id.id);
 
                 loop {
                     tokio::select! {
                         accept_res = listener.accept() => {
                             if let Ok((stream, _peer_addr)) = accept_res {
                                 let pool_ref = pool.clone();
+                                let conn_pool_ref = conn_pool.clone();
                                 let task_telemetry = tele_clone.clone();
                                 
                                 tokio_uring::spawn(async move {
-                                    // 🛡️ El Guardia Atómico nace aquí. Morirá automáticamente al salir de este bloque.
                                     let _guard = ConnectionGuard::new(task_telemetry.clone());
 
                                     let mut buf = pool_ref.borrow_mut().pop_front()
                                         .unwrap_or_else(|| Vec::with_capacity(BUFFER_SIZE));
                                     buf.clear(); 
 
-                                    let backend_addr: SocketAddr = CHRONOS_ADDR.parse().unwrap();
-
-                                    if let Ok(chronos_stream) = tokio_uring::net::TcpStream::connect(backend_addr).await {
-                                        let (read_res, buf_read) = stream.read(buf).await;
-
-                                        if let Ok(n) = read_res {
-                                            if n > 0 {
-                                                // 📊 Sumamos los bytes entrantes
-                                                task_telemetry.total_bytes.fetch_add(n, Ordering::Relaxed);
-
-                                                let (write_res, mut buf_written) = chronos_stream.write_all(buf_read).await;
-                                                
-                                                if write_res.is_ok() {
-                                                    buf_written.clear(); 
-                                                    let (resp_res, buf_resp) = chronos_stream.read(buf_written).await;
-
-                                                    if let Ok(resp_n) = resp_res {
-                                                        if resp_n > 0 {
-                                                            // 📊 Sumamos los bytes salientes (respuesta de Chronos)
-                                                            task_telemetry.total_bytes.fetch_add(resp_n, Ordering::Relaxed);
-
-                                                            let (_final_res, mut buf_final) = stream.write_all(buf_resp).await;
-                                                            buf_final.clear();
-                                                            pool_ref.borrow_mut().push_back(buf_final);
-                                                            return;
-                                                        }
-                                                    }
-                                                    let mut safe_buf = buf_resp; safe_buf.clear();
-                                                    pool_ref.borrow_mut().push_back(safe_buf);
-                                                    return;
-                                                }
-                                                buf_written.clear();
-                                                pool_ref.borrow_mut().push_back(buf_written);
+                                    // 1. OBTENER TUBERÍA CALIENTE: Extraemos una o conectamos una nueva si no hay
+                                    let chronos_stream = if let Some(hot_pipe) = conn_pool_ref.borrow_mut().pop_front() {
+                                        hot_pipe
+                                    } else {
+                                        let backend_addr: SocketAddr = CHRONOS_ADDR.parse().unwrap();
+                                        match tokio_uring::net::TcpStream::connect(backend_addr).await {
+                                            Ok(s) => s,
+                                            Err(_) => {
+                                                pool_ref.borrow_mut().push_back(buf);
                                                 return;
                                             }
                                         }
-                                        let mut safe_buf = buf_read; safe_buf.clear();
-                                        pool_ref.borrow_mut().push_back(safe_buf);
-                                        return;
+                                    };
+
+                                    // 2. LECTURA DEL CLIENTE
+                                    let (read_res, buf_read) = stream.read(buf).await;
+
+                                    if let Ok(n) = read_res {
+                                        if n > 0 {
+                                            task_telemetry.total_bytes.fetch_add(n, Ordering::Relaxed);
+
+                                            // 3. DISPARO A CHRONOS
+                                            let (write_res, mut buf_written) = chronos_stream.write_all(buf_read).await;
+                                            
+                                            if write_res.is_ok() {
+                                                buf_written.clear(); 
+                                                
+                                                // 4. LECTURA DE LA BÓVEDA
+                                                let (resp_res, buf_resp) = chronos_stream.read(buf_written).await;
+
+                                                if let Ok(resp_n) = resp_res {
+                                                    if resp_n > 0 {
+                                                        task_telemetry.total_bytes.fetch_add(resp_n, Ordering::Relaxed);
+
+                                                        // 5. RESPUESTA FINAL AL CLIENTE
+                                                        let (_final_res, mut buf_final) = stream.write_all(buf_resp).await;
+                                                        buf_final.clear();
+                                                        
+                                                        // 💥 FASE 5: Misión cumplida. Reciclamos la memoria Y la conexión.
+                                                        pool_ref.borrow_mut().push_back(buf_final);
+                                                        if conn_pool_ref.borrow().len() < MAX_HOT_PIPES {
+                                                            conn_pool_ref.borrow_mut().push_back(chronos_stream);
+                                                        }
+                                                        return;
+                                                    }
+                                                }
+                                                // Si Chronos falla, no reciclamos la conexión (se destruirá sola)
+                                                let mut safe_buf = buf_resp; safe_buf.clear();
+                                                pool_ref.borrow_mut().push_back(safe_buf);
+                                                return;
+                                            }
+                                            let mut safe_buf = buf_written; safe_buf.clear();
+                                            pool_ref.borrow_mut().push_back(safe_buf);
+                                            return;
+                                        }
                                     }
-                                    buf.clear();
-                                    pool_ref.borrow_mut().push_back(buf);
+                                    let mut safe_buf = buf_read; safe_buf.clear();
+                                    pool_ref.borrow_mut().push_back(safe_buf);
                                 });
                             }
                         }
@@ -146,7 +165,6 @@ async fn main() {
         handles.push(handle);
     }
 
-    // 🖥️ EL TABLERO HOLOGRÁFICO (Control Plane)
     println!("🛡️ [AEGIS CONTROL PLANE] Todos los sistemas nominales. HUD Activado.");
     let mut ticker = interval(Duration::from_secs(1));
 
@@ -157,12 +175,10 @@ async fn main() {
                 break;
             }
             _ = ticker.tick() => {
-                // Leemos la memoria atómica sin bloquear a los hilos trabajadores
                 let conns = telemetry.active_connections.load(Ordering::Relaxed);
                 let bytes = telemetry.total_bytes.load(Ordering::Relaxed);
                 let mb = bytes as f64 / 1_048_576.0;
                 
-                // Imprimimos solo si hay tráfico para no ensuciar la consola en reposo
                 if conns > 0 || bytes > 0 {
                     println!("📊 [HUD] Conexiones Activas: {} | Tráfico Total: {:.4} MB", conns, mb);
                 }
