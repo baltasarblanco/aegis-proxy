@@ -25,6 +25,7 @@ struct CachePadded<T>(T);
 struct Telemetry {
     active_connections: CachePadded<AtomicUsize>,
     total_bytes: CachePadded<AtomicUsize>,
+    total_requests: CachePadded<AtomicUsize>, // <--- NUEVO CONTADOR
 }
 
 struct ConnectionGuard {
@@ -54,8 +55,8 @@ async fn main() {
     let telemetry = Arc::new(Telemetry {
         active_connections: CachePadded(AtomicUsize::new(0)),
         total_bytes: CachePadded(AtomicUsize::new(0)),
+        total_requests: CachePadded(AtomicUsize::new(0)), // <--- NUEVO
     });
-
     // --- INICIO DEL PLANO DE DATOS (io_uring workers) ---
     for core_id in core_ids {
         let mut shutdown_rx = shutdown_tx.subscribe();
@@ -132,6 +133,8 @@ async fn main() {
 
                                                         let (_final_res, mut buf_final) = stream.write_all(buf_resp).await;
                                                         buf_final.clear();
+    
+                                                        task_telemetry.total_requests.0.fetch_add(1, Ordering::Relaxed); // <--- SUMAMOS LA PETICIÓN EXITOSA    
                                                         
                                                         pool_ref.borrow_mut().push_back(buf_final);
                                                         if conn_pool_ref.borrow().len() < MAX_HOT_PIPES {
@@ -181,20 +184,23 @@ async fn main() {
                     
                     let conns = tele.active_connections.0.load(Ordering::Relaxed);
                     let bytes = tele.total_bytes.0.load(Ordering::Relaxed);
-                    
-                    // Formato exacto que requiere Grafana/Prometheus
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\n\
-                        Content-Type: text/plain; version=0.0.4\r\n\
-                        Connection: close\r\n\r\n\
-                        # HELP aegis_active_connections Numero de conexiones L4 activas\n\
-                        # TYPE aegis_active_connections gauge\n\
-                        aegis_active_connections {}\n\
-                        # HELP aegis_total_bytes Total de bytes enrutados en la red\n\
-                        # TYPE aegis_total_bytes counter\n\
-                        aegis_total_bytes {}\n",
-                        conns, bytes
-                    );
+                    let reqs = tele.total_requests.0.load(Ordering::Relaxed); // <--- LEEMOS EL DATO
+    
+                      let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                            Content-Type: text/plain; version=0.0.4\r\n\
+                            Connection: close\r\n\r\n\
+                            # HELP aegis_active_connections Numero de conexiones activas\n\
+                            # TYPE aegis_active_connections gauge\n\
+                            aegis_active_connections {}\n\
+                            # HELP aegis_total_bytes Total de bytes\n\
+                            # TYPE aegis_total_bytes counter\n\
+                            aegis_total_bytes {}\n\
+                            # HELP aegis_total_requests Total de peticiones completadas\n\
+                            # TYPE aegis_total_requests counter\n\
+                            aegis_total_requests {}\n", // <--- LO AÑADIMOS AL FORMATO
+                            conns, bytes, reqs
+                        );
                     
                     let _ = stream.write_all(response.as_bytes()).await;
                 });
