@@ -48,8 +48,8 @@ cargo build --release
 ```
 2. Execute the binary (requires Linux Kernel 6.1+ for optimal io_uring support):
 
-´´´bash
+```bash
 ./target/release/aegis_proxy
-´´´ 
+```
 
 3. Monitor the Atomic HUD in the control plane terminal while blasting the proxy with your benchmarking tool of choice.
