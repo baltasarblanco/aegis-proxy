@@ -17,23 +17,31 @@ const BUFFER_SIZE: usize = 4096;
 const POOL_CAPACITY: usize = 1024;
 const MAX_HOT_PIPES: usize = 64;             // <--- FASE 5: Máximo de conexiones persistentes por núcleo
 
+// 💥 RICHARDS VECTOR: Acolchado de Caché (Cache Padding) a 64 bytes.
+// Esto evita el "False Sharing" forzando que la variable ocupe una línea de caché entera de la CPU.
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
+// 📊 FASE 4 (Mejorada): Stark HUD con Simpatía Mecánica Absoluta
 struct Telemetry {
-    active_connections: AtomicUsize,
-    total_bytes: AtomicUsize,
+    active_connections: CachePadded<AtomicUsize>,
+    total_bytes: CachePadded<AtomicUsize>,
 }
 
+// 🛡️ RAII Guard
 struct ConnectionGuard {
     tele: Arc<Telemetry>,
 }
 impl ConnectionGuard {
     fn new(tele: Arc<Telemetry>) -> Self {
-        tele.active_connections.fetch_add(1, Ordering::Relaxed);
+        // Nota el ".0" para acceder al valor dentro del CachePadded
+        tele.active_connections.0.fetch_add(1, Ordering::Relaxed);
         Self { tele }
     }
 }
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.tele.active_connections.fetch_sub(1, Ordering::Relaxed);
+        self.tele.active_connections.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -46,9 +54,10 @@ async fn main() {
     let addr: SocketAddr = BIND_ADDR.parse().expect("Dirección IP/Puerto inválidos");
     let mut handles = vec![];
 
+    // Instanciamos el Satélite de Telemetría Global
     let telemetry = Arc::new(Telemetry {
-        active_connections: AtomicUsize::new(0),
-        total_bytes: AtomicUsize::new(0),
+        active_connections: CachePadded(AtomicUsize::new(0)),
+        total_bytes: CachePadded(AtomicUsize::new(0)),
     });
 
     for core_id in core_ids {
@@ -115,7 +124,7 @@ async fn main() {
 
                                     if let Ok(n) = read_res {
                                         if n > 0 {
-                                            task_telemetry.total_bytes.fetch_add(n, Ordering::Relaxed);
+                                            task_telemetry.total_bytes.0.fetch_add(n, Ordering::Relaxed);
 
                                             // 3. DISPARO A CHRONOS
                                             let (write_res, mut buf_written) = chronos_stream.write_all(buf_read).await;
@@ -128,7 +137,7 @@ async fn main() {
 
                                                 if let Ok(resp_n) = resp_res {
                                                     if resp_n > 0 {
-                                                        task_telemetry.total_bytes.fetch_add(resp_n, Ordering::Relaxed);
+                                                        task_telemetry.total_bytes.0.fetch_add(resp_n, Ordering::Relaxed);
 
                                                         // 5. RESPUESTA FINAL AL CLIENTE
                                                         let (_final_res, mut buf_final) = stream.write_all(buf_resp).await;
@@ -175,8 +184,8 @@ async fn main() {
                 break;
             }
             _ = ticker.tick() => {
-                let conns = telemetry.active_connections.load(Ordering::Relaxed);
-                let bytes = telemetry.total_bytes.load(Ordering::Relaxed);
+                let conns = telemetry.active_connections.0.load(Ordering::Relaxed);
+                let bytes = telemetry.total_bytes.0.load(Ordering::Relaxed);
                 let mb = bytes as f64 / 1_048_576.0;
                 
                 if conns > 0 || bytes > 0 {
