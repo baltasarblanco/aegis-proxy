@@ -51,4 +51,4 @@ cargo run --release
 docker compose up -d
 ```
 
-3. Open http://localhost:3000 to view the live dashboard during load testing.
+3. Open `http://localhost:3000` to view the live dashboard during load testing.
