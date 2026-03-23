@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
-use tokio::io::{AsyncReadExt, AsyncWriteExt}; // <--- Necesario para el micro-servidor HTTP
+use tokio::io::{AsyncReadExt, AsyncWriteExt}; 
 
 const BIND_ADDR: &str = "0.0.0.0:8081";      // <--- El Escudo Frontal (AEGIS)
 const CHRONOS_ADDR: &str = "127.0.0.1:8080"; // <--- La Bóveda LSM (Chronos)
@@ -25,7 +25,7 @@ struct CachePadded<T>(T);
 struct Telemetry {
     active_connections: CachePadded<AtomicUsize>,
     total_bytes: CachePadded<AtomicUsize>,
-    total_requests: CachePadded<AtomicUsize>, // <--- NUEVO CONTADOR
+    total_requests: CachePadded<AtomicUsize>,
 }
 
 struct ConnectionGuard {
@@ -55,8 +55,9 @@ async fn main() {
     let telemetry = Arc::new(Telemetry {
         active_connections: CachePadded(AtomicUsize::new(0)),
         total_bytes: CachePadded(AtomicUsize::new(0)),
-        total_requests: CachePadded(AtomicUsize::new(0)), // <--- NUEVO
+        total_requests: CachePadded(AtomicUsize::new(0)),
     });
+
     // --- INICIO DEL PLANO DE DATOS (io_uring workers) ---
     for core_id in core_ids {
         let mut shutdown_rx = shutdown_tx.subscribe();
@@ -134,7 +135,7 @@ async fn main() {
                                                         let (_final_res, mut buf_final) = stream.write_all(buf_resp).await;
                                                         buf_final.clear();
     
-                                                        task_telemetry.total_requests.0.fetch_add(1, Ordering::Relaxed); // <--- SUMAMOS LA PETICIÓN EXITOSA    
+                                                        task_telemetry.total_requests.0.fetch_add(1, Ordering::Relaxed);
                                                         
                                                         pool_ref.borrow_mut().push_back(buf_final);
                                                         if conn_pool_ref.borrow().len() < MAX_HOT_PIPES {
@@ -172,35 +173,39 @@ async fn main() {
     // 📡 EL SATÉLITE STARK (Micro-Servidor HTTP para Prometheus)
     let tele_metrics = telemetry.clone();
     tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:8082").await.expect("Fallo al abrir puerto 8082");
-        println!("📡 [PROMETHEUS SATELLITE] Métricas expuestas en http://127.0.0.1:8082/metrics");
-        
+        let listener = match tokio::net::TcpListener::bind("0.0.0.0:8082").await {
+            Ok(l) => l,
+            Err(_) => {
+                println!("⚠️ [TELEMETRÍA] Puerto 8082 ocupado. Modo CLON activado (operando sin satélite).");
+                return;
+            }
+        };
         loop {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let tele = tele_metrics.clone();
                 tokio::spawn(async move {
                     let mut buf = [0; 512];
-                    let _ = stream.read(&mut buf).await; // Leemos y descartamos la petición GET
+                    let _ = stream.read(&mut buf).await;
                     
                     let conns = tele.active_connections.0.load(Ordering::Relaxed);
                     let bytes = tele.total_bytes.0.load(Ordering::Relaxed);
-                    let reqs = tele.total_requests.0.load(Ordering::Relaxed); // <--- LEEMOS EL DATO
+                    let reqs = tele.total_requests.0.load(Ordering::Relaxed);
     
-                      let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                            Content-Type: text/plain; version=0.0.4\r\n\
-                            Connection: close\r\n\r\n\
-                            # HELP aegis_active_connections Numero de conexiones activas\n\
-                            # TYPE aegis_active_connections gauge\n\
-                            aegis_active_connections {}\n\
-                            # HELP aegis_total_bytes Total de bytes\n\
-                            # TYPE aegis_total_bytes counter\n\
-                            aegis_total_bytes {}\n\
-                            # HELP aegis_total_requests Total de peticiones completadas\n\
-                            # TYPE aegis_total_requests counter\n\
-                            aegis_total_requests {}\n", // <--- LO AÑADIMOS AL FORMATO
-                            conns, bytes, reqs
-                        );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\n\
+                        Content-Type: text/plain; version=0.0.4\r\n\
+                        Connection: close\r\n\r\n\
+                        # HELP aegis_active_connections Numero de conexiones activas\n\
+                        # TYPE aegis_active_connections gauge\n\
+                        aegis_active_connections {}\n\
+                        # HELP aegis_total_bytes Total de bytes\n\
+                        # TYPE aegis_total_bytes counter\n\
+                        aegis_total_bytes {}\n\
+                        # HELP aegis_total_requests Total de peticiones completadas\n\
+                        # TYPE aegis_total_requests counter\n\
+                        aegis_total_requests {}\n",
+                        conns, bytes, reqs
+                    );
                     
                     let _ = stream.write_all(response.as_bytes()).await;
                 });
@@ -227,7 +232,7 @@ async fn main() {
             }
         }
     }
-
+    
     let _ = shutdown_tx.send(());
     for handle in handles {
         handle.join().unwrap();
