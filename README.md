@@ -1,54 +1,82 @@
-# 🛡️ AEGIS: Ultra-High-Performance L4 TCP Proxy
+# 🛡️ AEGIS — L4 TCP Proxy
 
-AEGIS is a bare-metal TCP (L4) proxy written in pure Rust. Engineered to act as a resilient shield for high-throughput backend databases (specifically, a custom LSM-Tree engine named Chronos), it maximizes mechanical sympathy by minimizing context switches via asynchronous syscall batching and eliminating cross-core lock contention.
+![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square)
+![io_uring](https://img.shields.io/badge/IO-io__uring-blue?style=flat-square)
+![License](https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square)
+![RPS](https://img.shields.io/badge/RPS-8.4k-brightgreen)
+![P99](https://img.shields.io/badge/P99-%3C1ms-brightgreen)
 
+A Layer 4 TCP proxy written in Rust. Built for low‑latency routing to backend databases (like [Chronos](https://github.com/baltasarblanco/chronos_lsm)), it uses thread‑per‑core, `io_uring`, and zero‑allocation hot paths to keep tail latency under 1 ms.
 
+---
 
-## 🧠 Architecture: The Silicon Sympathy Approach
-AEGIS discards traditional global thread-pools and standard `epoll` event loops. It operates entirely on a **Thread-per-Core (Shared-Nothing)** paradigm to achieve absolute zero lock-contention and linear scalability.
+## ⚙️ Design
 
-* **Core Pinning (`core_affinity`):** Spawns exactly N OS threads (matching physical/logical cores) and magnetically pins them to the CPU silicon. CPU Cache L1/L2 is strictly preserved.
-* **Hardware-Level Load Balancing (`SO_REUSEPORT`):** Raw sockets are forged in C (`socket2`) before entering Rust. We rely on the NIC and the Linux Kernel's hash algorithms to distribute incoming SYN packets directly to the isolated cores.
-* **Syscall Batching (`io_uring`):** Uses `tokio-uring` for high-performance I/O, replacing traditional `epoll` loops with shared-memory Submission/Completion Queues to drastically reduce syscall overhead.
-* **Zero-Allocation Hot Path:** Pre-allocated Thread-Local Memory Pools (Slab Allocators via `VecDeque`). Memory is recycled for active connections, ensuring deterministic behavior and zero `malloc` calls during the hot path of traffic routing.
-* **Cache Line Padding:** Telemetry atomics are wrapped in `#[repr(align(64))]` to perfectly align with CPU cache lines, completely eradicating false sharing across cores.
+- **Thread‑per‑core architecture**: one OS thread per physical core, pinned via `core_affinity`. No shared data, no locks.
+- **`SO_REUSEPORT` + socket sharding**: the kernel distributes incoming connections across threads directly.
+- **`io_uring` I/O**: submission and completion queues replace `epoll` to batch syscalls and reduce overhead.
+- **Zero‑allocation hot path**: pre‑allocated thread‑local buffers (`VecDeque`) recycle connection memory; no `malloc` during traffic forwarding.
+- **Persistent backend connections**: a per‑thread pool of pre‑connected sockets to the backend eliminates repeated TCP handshakes.
+- **Lock‑free telemetry**: atomic counters aligned to 64‑byte cache lines (no false sharing), exported via a separate HTTP endpoint.
 
-## 📉 Performance Evolution: The TCP Handshake Bottleneck
-During initial load testing, the proxy hit a wall at ~4,400 RPS. Profiling revealed that the `epoll` starvation wasn't the issue; the bottleneck was the repeated TCP handshakes (`SYN/ACK` cycles) to the backend database under high connection churn. 
-
-By implementing a **thread-local persistent connection pool ("hot pipes")** in Phase 5, AEGIS bypassed backend connection teardowns, effectively doubling the throughput to 8,400+ RPS and cutting P99 latency by 55%.
-
-## 🚀 The 5 Phases of AEGIS
-- [x] **Phase 1: Silicon Topology.** Core detection, thread pinning, raw socket forging, and isolated `io_uring` runtimes.
-- [x] **Phase 2: The Thermal Loop.** Zero-allocation hot path. Pre-allocated Thread-Local Memory Pools.
-- [x] **Phase 3: Particle Accelerator.** L4 Routing and asynchronous data passing through Kernel shared rings.
-- [x] **Phase 4: Stark HUD.** Lock-free atomic telemetry and Graceful Shutdown coordinated via a Broadcast Control Plane.
-- [x] **Phase 5: Symbiosis.** Persistent connection pooling (Thread-Local Hot Pipes) with the Chronos LSM-Tree backend.
+---
 
 ## 📊 Benchmarks
-Tested on local consumer hardware (AMD Ryzen) routing traffic to a local LSM-Tree Database (Chronos). 
 
-**Attack Vector (500k total requests across 200 concurrent connections):** `ab -k -n 500000 -c 200 http://127.0.0.1:8081/`
+*Local consumer hardware (AMD Ryzen), routing to a local LSM‑Tree backend. 500 k requests, 200 concurrent connections, `ab -k -n 500000 -c 200 http://127.0.0.1:8081/`.*
 
-| Metric | Result | Note |
-| :--- | :--- | :--- |
-| **Complete Requests** | `500,000` | 100% Success Rate |
-| **Failed Requests** | `0` | Zero dropped connections under load |
-| **Requests per Second** | `~8,400+ [#/sec]` | Full Proxy + DB Round-Trips |
-| **P99 Latency** | `< 1 ms` | 99% of requests routed in less than 1 millisecond |
-| **Max Latency** | `4 ms` | Absolute worst-case scenario |
+| Metric               | Result          |
+|----------------------|-----------------|
+| Requests completed   | 500 000         |
+| Failed requests      | 0               |
+| Requests per second  | **8 400+**      |
+| P99 latency          | **< 1 ms**      |
+| Max latency          | 4 ms            |
 
-## 🛰️ Observability (Grafana & Prometheus)
-AEGIS features a lock-free, zero-cost HTTP metrics satellite running on the Control Plane (`port 8082`). You can visualize RPS and Bandwidth in real-time without locking the data plane.
+---
 
-1. Boot the proxy and the backend:
+## 🧱 Architecture
+
+1. **Control plane** – spawns worker threads, binds shared‑nothing sockets, exposes `/metrics` on `:8082`.
+2. **Worker threads** – each runs an independent `io_uring` event loop, accepts connections from its own socket, and forwards traffic using a local backend connection pool.
+3. **Telemetry** – per‑thread atomic metrics (connections, bytes, errors) aggregated and served via a lightweight HTTP handler.
+
+---
+
+## 🚀 Quick Start
+
+### 1. Clone
+```bash
+git clone https://github.com/baltasarblanco/aegis-proxy.git
+cd aegis-proxy
+```
+
+### 2. Run (needs a backend on localhost, e.g. Chronos)
 ```bash
 cargo run --release
+# AEGIS listening on 127.0.0.1:8081, telemetry on :8082
 ```
-2. Launch the telemetry stack:
 
+### Load test
+```bash
+ab -k -n 100000 -c 100 http://127.0.0.1:8081/
+```
+
+### 4. Observe metrics
+```bash
+curl http://localhost:8082/metrics
+```
+*(Optional) Start Prometheus + Grafana:*
 ```bash
 docker compose up -d
+# Grafana at http://localhost:3000
 ```
 
-3. Open `http://localhost:3000` to view the live dashboard during load testing.
+---
+
+## 📄 License
+MIT
+
+---
+
+*Built by Baltasar Blanco — systems engineer, Rustacean.*
